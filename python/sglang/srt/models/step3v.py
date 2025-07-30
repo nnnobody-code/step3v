@@ -4,32 +4,27 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
-    get_tensor_model_parallel_rank,
 )
-from sglang.srt.layers.communicator import (
-    LayerCommunicator,
-    LayerScatterModes,
-)
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    ColumnParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -37,16 +32,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers, log_info_on_rank0
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.moe.topk import TopK
-
+from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
 
 logger = logging.getLogger(__name__)
 
 Step3vConfig = None
+
 
 class Step3vMLP(nn.Module):
     def __init__(
@@ -59,7 +53,7 @@ class Step3vMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, 
+            hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
@@ -87,7 +81,7 @@ class Step3vMLP(nn.Module):
 
 
 class Step3vMoEMLP(nn.Module):
-    # Native 
+    # Native
     def __init__(
         self,
         layer_id: int,
@@ -103,13 +97,13 @@ class Step3vMoEMLP(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.moe_num_experts}."
             )
-            
+
         self.topk = TopK(
             top_k=config.moe_top_k,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
         )
-        
+
         self.experts = get_moe_impl_class()(
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
@@ -146,7 +140,7 @@ class Step3vMoEMLP(nn.Module):
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        
+
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(
@@ -157,20 +151,21 @@ class Step3vMoEMLP(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+
 class Step3vAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        head_dim: int, 
+        head_dim: int,
         share_q_dim: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
-        rms_norm_eps = None,
+        rms_norm_eps=None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -202,14 +197,14 @@ class Step3vAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        
+
         self.qkv_proj = MergedColumnParallelLinear(
             hidden_size,
             [self.q_size, self.kv_size, self.kv_size],
             bias=False,
             quant_config=quant_config,
-            tp_rank=0,      # In fact, we need a MergedReplicatedLinear
-            tp_size=1,      
+            tp_rank=0,  # In fact, we need a MergedReplicatedLinear
+            tp_size=1,
             prefix=f"{prefix}.qkv_proj",
         )
 
@@ -223,9 +218,9 @@ class Step3vAttention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
-        
+
         self.inter_norm = RMSNorm(self.q_size, eps=rms_norm_eps)
-        
+
         self.wq = ColumnParallelLinear(
             self.q_size,
             self.head_dim * self.total_num_heads,
@@ -273,7 +268,8 @@ class Step3vAttention(nn.Module):
         # torch.save([attn_output], f"fa3attn_{self.attn_tp_rank}_{self.layer_id}.pt")
         output, _ = self.o_proj(attn_output)
         return output
-    
+
+
 class Step3vDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -300,7 +296,7 @@ class Step3vDecoderLayer(nn.Module):
         rms_norm_eps = config.rms_norm_eps
         self.self_attn = Step3vAttention(
             hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads, 
+            num_heads=config.num_attention_heads,
             num_kv_heads=1,
             head_dim=head_dim,
             share_q_dim=config.share_q_dim,
@@ -315,11 +311,11 @@ class Step3vDecoderLayer(nn.Module):
 
         moe_layers_enum = getattr(config, "moe_layers_enum", None)
         if moe_layers_enum is not None:
-            moe_layers_idx = [int(i) for i in moe_layers_enum.strip().split(',')]
+            moe_layers_idx = [int(i) for i in moe_layers_enum.strip().split(",")]
         else:
             # Default to 1dense.
             moe_layers_idx = [i for i in range(1, config.num_hidden_layers)]
-        
+
         self.use_moe = False
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -329,7 +325,9 @@ class Step3vDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
         self.is_layer_sparse = True if layer_id in moe_layers_idx else False
-        self.is_previous_layer_sparse = True if layer_id - 1 in moe_layers_idx else False
+        self.is_previous_layer_sparse = (
+            True if layer_id - 1 in moe_layers_idx else False
+        )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
@@ -350,26 +348,26 @@ class Step3vDecoderLayer(nn.Module):
             self.use_moe = True
             if self.num_fused_shared_experts == 0:
                 self.moe = Step3vMoEMLP(
-                    layer_id = layer_id,
+                    layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp", prefix),
                 )
                 self.share_expert = Step3vMLP(
-                    hidden_size = config.hidden_size,
-                    intermediate_size = config.share_expert_dim,
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.share_expert_dim,
                     hidden_act="silu",
                     quant_config=quant_config,
                     prefix=add_prefix("share_expert", prefix),
                 )
             else:
                 self.moe = Step3vMoEMLP(
-                    layer_id = layer_id,
+                    layer_id=layer_id,
                     config=config,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp", prefix),
                 )
-                    
+
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -392,18 +390,18 @@ class Step3vDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-        
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -415,7 +413,7 @@ class Step3vDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
-        
+
         return hidden_states, residual
 
 
@@ -474,7 +472,7 @@ class Step3vModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-    
+
 
 class Step3vForConditionalGeneration(nn.Module):
 
@@ -490,7 +488,7 @@ class Step3vForConditionalGeneration(nn.Module):
         self.model = Step3vModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        #self.vision_model = StepCLIPVisionTransformer()
+        # self.vision_model = StepCLIPVisionTransformer()
         # TODO: after textmodel is ok.
         self.n_shared_experts = 1
         # self.num_fused_shared_experts = (
@@ -525,7 +523,7 @@ class Step3vForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        #TODO: 
+        # TODO:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", 0),
@@ -534,50 +532,55 @@ class Step3vForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
-        
+
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
-        
+
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.moe_num_experts + self.num_fused_shared_experts,
         )
-                
+
         params_dict = dict(self.named_parameters())
         loaded_params = set()
-        
+
         def match_expert_and_shard_ids(name_path: str, weight_path: str) -> bool:
-            name_parts = name_path.split('.')
-            weight_parts = weight_path.split('.')
+            name_parts = name_path.split(".")
+            weight_parts = weight_path.split(".")
             # print("shard_id", name_parts[4], weight_parts[2])
             shard_id_matches = name_parts[4] == weight_parts[2]
             return shard_id_matches
 
-
-
         for name, loaded_weight in weights:
             exclude = False
-            for exclude_name in ["vit_downsampler", "vision_model", "vit_large_projector"]:
+            for exclude_name in [
+                "vit_downsampler",
+                "vision_model",
+                "vit_large_projector",
+            ]:
                 if exclude_name in name:
                     exclude = True
             if exclude:
                 continue
-            #TODO: support vision model
+            # TODO: support vision model
             if self.num_fused_shared_experts > 0 and "share" in name:
                 # assert False
-                FLAG = 0 
+                FLAG = 0
                 name = name.replace("share_expert", "moe")
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
-                    if expert_id != self.config.moe_num_experts or not match_expert_and_shard_ids(name, weight_name):
+                    if (
+                        expert_id != self.config.moe_num_experts
+                        or not match_expert_and_shard_ids(name, weight_name)
+                    ):
                         continue
-                
-                    part_name = weight_name.split('.')[-2]
+
+                    part_name = weight_name.split(".")[-2]
                     fake_weight_name = name.replace(part_name, weight_name[:-1])
-                    actual_param_name = name.replace(part_name+'.', param_name)
+                    actual_param_name = name.replace(part_name + ".", param_name)
                     param = params_dict[actual_param_name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -588,17 +591,17 @@ class Step3vForConditionalGeneration(nn.Module):
                         expert_id=expert_id,
                     )
                     print("actual_param_name", actual_param_name)
-                    print("name ", name, expert_id, shard_id    )
+                    print("name ", name, expert_id, shard_id)
                     # loaded_params.add(actual_param_name)
                     FLAG = 1
                     break
                 # assert FLAG == 1
                 continue
-        
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if 'gate.' not in name and 'moe' in name:
+                if "gate." not in name and "moe" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
@@ -611,28 +614,29 @@ class Step3vForConditionalGeneration(nn.Module):
             else:
                 if "moe" not in name:
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
-                    loaded_params.add(name)   
+                    loaded_params.add(name)
                 else:
-                    if 'gate.' in name:
+                    if "gate." in name:
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(param, loaded_weight)
                         loaded_params.add(name)
                         continue
-                    
+
                     for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping      
+                        param_name, weight_name, expert_id, shard_id = mapping
                         if expert_id == self.config.moe_num_experts:
                             continue
                         if not match_expert_and_shard_ids(name, weight_name):
                             continue
-                        part_name = weight_name.split('.')[-2]
+                        part_name = weight_name.split(".")[-2]
                         fake_weight_name = name.replace(part_name, weight_name[:-1])
-                        actual_param_name = name.replace(part_name+'.', param_name)
+                        actual_param_name = name.replace(part_name + ".", param_name)
                         param = params_dict[actual_param_name]
                         weight_loader = param.weight_loader
                         weight_loader(
@@ -644,8 +648,8 @@ class Step3vForConditionalGeneration(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
                         # Don't break here, because this 'loaded_weight' includes all the weights for this layer
-                
-        print(params_dict.keys()-loaded_params)
+
+        print(params_dict.keys() - loaded_params)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -655,7 +659,9 @@ class Step3vForConditionalGeneration(nn.Module):
             num_groups=None,
         )
 
+
 class MMGPTStep3vForCausalLM(Step3vForConditionalGeneration):
     pass
+
 
 EntryClass = MMGPTStep3vForCausalLM

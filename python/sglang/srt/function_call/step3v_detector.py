@@ -150,7 +150,7 @@ class Step3VDetector(BaseFormatDetector):
                 type_part, invoke_part = call_content.split(self.tool_sep, 1)
                 if type_part.strip() != "function":
                     continue
-                
+
                 func_name, params = self._parse_steptml_invoke(invoke_part, tools)
                 if func_name:
                     # Use parse_base_json to create the ToolCallItem
@@ -371,7 +371,6 @@ class Step3VDetector(BaseFormatDetector):
                 # Update current state
                 self._current_parameters = new_params
                 self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
-
 
             # Check if tool call is complete
             if self.tool_call_end in self._buffer:
