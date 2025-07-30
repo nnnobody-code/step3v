@@ -649,8 +649,6 @@ class Step3vForConditionalGeneration(nn.Module):
                         loaded_params.add(actual_param_name)
                         # Don't break here, because this 'loaded_weight' includes all the weights for this layer
 
-        print(params_dict.keys() - loaded_params)
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
